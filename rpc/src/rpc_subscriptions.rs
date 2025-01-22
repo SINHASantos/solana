@@ -19,7 +19,6 @@ use {
     solana_account_decoder::{parse_token::is_known_spl_token_id, UiAccount, UiAccountEncoding},
     solana_ledger::{blockstore::Blockstore, get_tmp_ledger_path},
     solana_measure::measure::Measure,
-    solana_rayon_threadlimit::get_thread_count,
     solana_rpc_client_api::response::{
         ProcessedSignatureResult, ReceivedSignatureResult, Response as RpcResponse, RpcBlockUpdate,
         RpcBlockUpdateError, RpcKeyedAccount, RpcLogsResponse, RpcResponseContext,
@@ -383,7 +382,7 @@ fn filter_account_result(
         if is_known_spl_token_id(account.owner())
             && params.encoding == UiAccountEncoding::JsonParsed
         {
-            get_parsed_token_account(&bank, &params.pubkey, account)
+            get_parsed_token_account(&bank, &params.pubkey, account, None)
         } else {
             UiAccount::encode(&params.pubkey, &account, params.encoding, None, None)
         }
@@ -631,41 +630,37 @@ impl RpcSubscriptions {
                 config.queue_capacity_bytes,
             )),
         };
-        let notification_threads = config.notification_threads.unwrap_or_else(get_thread_count);
-        let t_cleanup = if notification_threads == 0 {
-            None
-        } else {
+
+        let t_cleanup = config.notification_threads.map(|notification_threads| {
             let exit = exit.clone();
-            Some(
-                Builder::new()
-                    .name("solRpcNotifier".to_string())
-                    .spawn(move || {
-                        let pool = rayon::ThreadPoolBuilder::new()
-                            .num_threads(notification_threads)
-                            .thread_name(|i| format!("solRpcNotify{i:02}"))
-                            .build()
-                            .unwrap();
-                        pool.install(|| {
-                            if let Some(rpc_notifier_ready) = rpc_notifier_ready {
-                                rpc_notifier_ready.fetch_or(true, Ordering::Relaxed);
-                            }
-                            Self::process_notifications(
-                                exit,
-                                max_complete_transaction_status_slot,
-                                max_complete_rewards_slot,
-                                blockstore,
-                                notifier,
-                                notification_receiver,
-                                subscriptions,
-                                bank_forks,
-                                block_commitment_cache,
-                                optimistically_confirmed_bank,
-                            )
-                        });
-                    })
-                    .unwrap(),
-            )
-        };
+            Builder::new()
+                .name("solRpcNotifier".to_string())
+                .spawn(move || {
+                    let pool = rayon::ThreadPoolBuilder::new()
+                        .num_threads(notification_threads.get())
+                        .thread_name(|i| format!("solRpcNotify{i:02}"))
+                        .build()
+                        .unwrap();
+                    pool.install(|| {
+                        if let Some(rpc_notifier_ready) = rpc_notifier_ready {
+                            rpc_notifier_ready.fetch_or(true, Ordering::Relaxed);
+                        }
+                        Self::process_notifications(
+                            exit,
+                            max_complete_transaction_status_slot,
+                            max_complete_rewards_slot,
+                            blockstore,
+                            notifier,
+                            notification_receiver,
+                            subscriptions,
+                            bank_forks,
+                            block_commitment_cache,
+                            optimistically_confirmed_bank,
+                        )
+                    });
+                })
+                .unwrap()
+        });
 
         let control = SubscriptionControl::new(
             config.max_active_subscriptions,
@@ -674,11 +669,7 @@ impl RpcSubscriptions {
         );
 
         Self {
-            notification_sender: if notification_threads == 0 {
-                None
-            } else {
-                Some(notification_sender)
-            },
+            notification_sender: config.notification_threads.map(|_| notification_sender),
             t_cleanup,
             exit,
             control,
@@ -1259,6 +1250,7 @@ pub(crate) mod tests {
             rpc_pubsub_service,
         },
         serial_test::serial,
+        solana_ledger::get_tmp_ledger_path_auto_delete,
         solana_rpc_client_api::config::{
             RpcAccountInfoConfig, RpcBlockSubscribeConfig, RpcBlockSubscribeFilter,
             RpcProgramAccountsConfig, RpcSignatureSubscribeConfig, RpcTransactionLogsConfig,
@@ -1324,7 +1316,7 @@ pub(crate) mod tests {
         } = create_genesis_config(100);
         let bank = Bank::new_for_tests(&genesis_config);
         let blockhash = bank.last_blockhash();
-        let bank_forks = Arc::new(RwLock::new(BankForks::new(bank)));
+        let bank_forks = BankForks::new_rw_arc(bank);
         let bank0 = bank_forks.read().unwrap().get(0).unwrap();
         let bank1 = Bank::new_from_parent(bank0, &Pubkey::default(), 1);
         bank_forks.write().unwrap().insert(bank1);
@@ -1470,11 +1462,11 @@ pub(crate) mod tests {
         } = create_genesis_config(10_000);
         let bank = Bank::new_for_tests(&genesis_config);
         let rent_exempt_amount = bank.get_minimum_balance_for_rent_exemption(0);
-        let bank_forks = Arc::new(RwLock::new(BankForks::new(bank)));
+        let bank_forks = BankForks::new_rw_arc(bank);
         let optimistically_confirmed_bank =
             OptimisticallyConfirmedBank::locked_from_bank_forks_root(&bank_forks);
-        let ledger_path = get_tmp_ledger_path!();
-        let blockstore = Blockstore::open(&ledger_path).unwrap();
+        let ledger_path = get_tmp_ledger_path_auto_delete!();
+        let blockstore = Blockstore::open(ledger_path.path()).unwrap();
         let blockstore = Arc::new(blockstore);
         let max_complete_transaction_status_slot = Arc::new(AtomicU64::default());
         let max_complete_rewards_slot = Arc::new(AtomicU64::default());
@@ -1590,11 +1582,11 @@ pub(crate) mod tests {
         } = create_genesis_config(10_000);
         let bank = Bank::new_for_tests(&genesis_config);
         let rent_exempt_amount = bank.get_minimum_balance_for_rent_exemption(0);
-        let bank_forks = Arc::new(RwLock::new(BankForks::new(bank)));
+        let bank_forks = BankForks::new_rw_arc(bank);
         let optimistically_confirmed_bank =
             OptimisticallyConfirmedBank::locked_from_bank_forks_root(&bank_forks);
-        let ledger_path = get_tmp_ledger_path!();
-        let blockstore = Blockstore::open(&ledger_path).unwrap();
+        let ledger_path = get_tmp_ledger_path_auto_delete!();
+        let blockstore = Blockstore::open(ledger_path.path()).unwrap();
         let blockstore = Arc::new(blockstore);
         let max_complete_transaction_status_slot = Arc::new(AtomicU64::default());
         let max_complete_rewards_slot = Arc::new(AtomicU64::default());
@@ -1708,11 +1700,11 @@ pub(crate) mod tests {
         } = create_genesis_config(10_000);
         let bank = Bank::new_for_tests(&genesis_config);
         let rent_exempt_amount = bank.get_minimum_balance_for_rent_exemption(0);
-        let bank_forks = Arc::new(RwLock::new(BankForks::new(bank)));
+        let bank_forks = BankForks::new_rw_arc(bank);
         let optimistically_confirmed_bank =
             OptimisticallyConfirmedBank::locked_from_bank_forks_root(&bank_forks);
-        let ledger_path = get_tmp_ledger_path!();
-        let blockstore = Blockstore::open(&ledger_path).unwrap();
+        let ledger_path = get_tmp_ledger_path_auto_delete!();
+        let blockstore = Blockstore::open(ledger_path.path()).unwrap();
         let blockstore = Arc::new(blockstore);
         let max_complete_transaction_status_slot = Arc::new(AtomicU64::default());
         let max_complete_rewards_slot = Arc::new(AtomicU64::default());
@@ -1826,7 +1818,7 @@ pub(crate) mod tests {
         } = create_genesis_config(100);
         let bank = Bank::new_for_tests(&genesis_config);
         let blockhash = bank.last_blockhash();
-        let bank_forks = Arc::new(RwLock::new(BankForks::new(bank)));
+        let bank_forks = BankForks::new_rw_arc(bank);
         let alice = Keypair::new();
         let tx = system_transaction::create_account(
             &mint_keypair,
@@ -1837,7 +1829,7 @@ pub(crate) mod tests {
             &stake::program::id(),
         );
         bank_forks
-            .write()
+            .read()
             .unwrap()
             .get(0)
             .unwrap()
@@ -1938,7 +1930,7 @@ pub(crate) mod tests {
         bank.lazy_rent_collection.store(true, Relaxed);
 
         let blockhash = bank.last_blockhash();
-        let bank_forks = Arc::new(RwLock::new(BankForks::new(bank)));
+        let bank_forks = BankForks::new_rw_arc(bank);
 
         let bank0 = bank_forks.read().unwrap().get(0).unwrap();
         let bank1 = Bank::new_from_parent(bank0, &Pubkey::default(), 1);
@@ -2133,7 +2125,7 @@ pub(crate) mod tests {
         bank.lazy_rent_collection.store(true, Relaxed);
 
         let blockhash = bank.last_blockhash();
-        let bank_forks = Arc::new(RwLock::new(BankForks::new(bank)));
+        let bank_forks = BankForks::new_rw_arc(bank);
 
         let bank0 = bank_forks.read().unwrap().get(0).unwrap();
         let bank1 = Bank::new_from_parent(bank0, &Pubkey::default(), 1);
@@ -2249,7 +2241,7 @@ pub(crate) mod tests {
         bank.lazy_rent_collection.store(true, Relaxed);
 
         let blockhash = bank.last_blockhash();
-        let bank_forks = Arc::new(RwLock::new(BankForks::new(bank)));
+        let bank_forks = BankForks::new_rw_arc(bank);
 
         let bank0 = bank_forks.read().unwrap().get(0).unwrap();
         let bank1 = Bank::new_from_parent(bank0, &Pubkey::default(), 1);
@@ -2435,7 +2427,7 @@ pub(crate) mod tests {
         } = create_genesis_config(100);
         let bank = Bank::new_for_tests(&genesis_config);
         let blockhash = bank.last_blockhash();
-        let mut bank_forks = BankForks::new(bank);
+        let bank_forks = BankForks::new_rw_arc(bank);
         let alice = Keypair::new();
 
         let past_bank_tx =
@@ -2446,26 +2438,28 @@ pub(crate) mod tests {
             system_transaction::transfer(&mint_keypair, &alice.pubkey(), 3, blockhash);
 
         bank_forks
+            .read()
+            .unwrap()
             .get(0)
             .unwrap()
             .process_transaction(&past_bank_tx)
             .unwrap();
 
         let next_bank = Bank::new_from_parent(
-            bank_forks.get(0).unwrap(),
+            bank_forks.read().unwrap().get(0).unwrap(),
             &solana_sdk::pubkey::new_rand(),
             1,
         );
-        bank_forks.insert(next_bank);
+        bank_forks.write().unwrap().insert(next_bank);
 
         bank_forks
+            .read()
+            .unwrap()
             .get(1)
             .unwrap()
             .process_transaction(&processed_tx)
             .unwrap();
-        let bank1 = bank_forks[1].clone();
-
-        let bank_forks = Arc::new(RwLock::new(bank_forks));
+        let bank1 = bank_forks.read().unwrap().get(1).unwrap().clone();
 
         let mut cache0 = BlockCommitment::default();
         cache0.increase_confirmation_stake(1, 10);
@@ -2659,7 +2653,7 @@ pub(crate) mod tests {
         let exit = Arc::new(AtomicBool::new(false));
         let GenesisConfigInfo { genesis_config, .. } = create_genesis_config(10_000);
         let bank = Bank::new_for_tests(&genesis_config);
-        let bank_forks = Arc::new(RwLock::new(BankForks::new(bank)));
+        let bank_forks = BankForks::new_rw_arc(bank);
         let optimistically_confirmed_bank =
             OptimisticallyConfirmedBank::locked_from_bank_forks_root(&bank_forks);
         let max_complete_transaction_status_slot = Arc::new(AtomicU64::default());
@@ -2706,7 +2700,7 @@ pub(crate) mod tests {
         let exit = Arc::new(AtomicBool::new(false));
         let GenesisConfigInfo { genesis_config, .. } = create_genesis_config(10_000);
         let bank = Bank::new_for_tests(&genesis_config);
-        let bank_forks = Arc::new(RwLock::new(BankForks::new(bank)));
+        let bank_forks = BankForks::new_rw_arc(bank);
         let optimistically_confirmed_bank =
             OptimisticallyConfirmedBank::locked_from_bank_forks_root(&bank_forks);
         let max_complete_transaction_status_slot = Arc::new(AtomicU64::default());
@@ -2755,7 +2749,7 @@ pub(crate) mod tests {
         } = create_genesis_config(100);
         let bank = Bank::new_for_tests(&genesis_config);
         let blockhash = bank.last_blockhash();
-        let bank_forks = Arc::new(RwLock::new(BankForks::new(bank)));
+        let bank_forks = BankForks::new_rw_arc(bank);
         let bank0 = bank_forks.read().unwrap().get(0).unwrap();
         let bank1 = Bank::new_from_parent(bank0.clone(), &Pubkey::default(), 1);
         bank_forks.write().unwrap().insert(bank1);
@@ -2815,7 +2809,7 @@ pub(crate) mod tests {
 
         // Add the same transaction to the unfrozen 2nd bank
         bank_forks
-            .write()
+            .read()
             .unwrap()
             .get(2)
             .unwrap()
@@ -2969,7 +2963,7 @@ pub(crate) mod tests {
         } = create_genesis_config(100);
         let bank = Bank::new_for_tests(&genesis_config);
         let blockhash = bank.last_blockhash();
-        let bank_forks = Arc::new(RwLock::new(BankForks::new(bank)));
+        let bank_forks = BankForks::new_rw_arc(bank);
 
         let alice = Keypair::new();
 
@@ -3053,7 +3047,7 @@ pub(crate) mod tests {
         let bank = Bank::new_for_tests(&genesis_config);
         let max_complete_transaction_status_slot = Arc::new(AtomicU64::default());
         let max_complete_rewards_slot = Arc::new(AtomicU64::default());
-        let bank_forks = Arc::new(RwLock::new(BankForks::new(bank)));
+        let bank_forks = BankForks::new_rw_arc(bank);
         let subscriptions = Arc::new(RpcSubscriptions::default_with_bank_forks(
             max_complete_transaction_status_slot,
             max_complete_rewards_slot,

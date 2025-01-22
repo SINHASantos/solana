@@ -3,7 +3,6 @@ use {
         bank::{Bank, BankFieldsToDeserialize, BankRc},
         builtins::BuiltinPrototype,
         epoch_stakes::EpochStakes,
-        runtime_config::RuntimeConfig,
         serde_snapshot::storage::SerializableAccountStorageEntry,
         snapshot_utils::{
             self, SnapshotError, StorageAndNextAppendVecId, BANK_SNAPSHOT_PRE_FILENAME_EXTENSION,
@@ -26,9 +25,9 @@ use {
         accounts_update_notifier_interface::AccountsUpdateNotifier,
         blockhash_queue::BlockhashQueue,
         epoch_accounts_hash::EpochAccountsHash,
-        rent_collector::RentCollector,
     },
     solana_measure::measure::Measure,
+    solana_program_runtime::runtime_config::RuntimeConfig,
     solana_sdk::{
         clock::{Epoch, Slot, UnixTimestamp},
         deserialize_utils::default_on_eof,
@@ -39,6 +38,7 @@ use {
         hash::Hash,
         inflation::Inflation,
         pubkey::Pubkey,
+        rent_collector::RentCollector,
     },
     std::{
         collections::{HashMap, HashSet},
@@ -620,7 +620,7 @@ where
         bank_fields.incremental_snapshot_persistence.as_ref(),
     )?;
 
-    let bank_rc = BankRc::new(Accounts::new_empty(accounts_db), bank_fields.slot);
+    let bank_rc = BankRc::new(Accounts::new(Arc::new(accounts_db)), bank_fields.slot);
     let runtime_config = Arc::new(runtime_config.clone());
 
     // if limit_load_slot_count_from_snapshot is set, then we need to side-step some correctness checks beneath this call
@@ -940,8 +940,6 @@ where
         .rent_paying_accounts_by_partition
         .set(rent_paying_accounts_by_partition)
         .unwrap();
-
-    accounts_db.maybe_add_filler_accounts(&genesis_config.epoch_schedule, snapshot_slot);
 
     handle.join().unwrap();
     measure_notify.stop();

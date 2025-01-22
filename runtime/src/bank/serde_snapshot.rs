@@ -3,11 +3,10 @@ mod tests {
     use {
         crate::{
             bank::{
-                epoch_accounts_hash_utils, Bank, BankTestConfig, EpochRewardStatus,
+                epoch_accounts_hash_utils, test_utils as bank_test_utils, Bank, EpochRewardStatus,
                 StartBlockHeightAndRewards,
             },
-            genesis_utils::{activate_all_features, activate_feature},
-            runtime_config::RuntimeConfig,
+            genesis_utils::activate_all_features,
             serde_snapshot::{
                 reserialize_bank_with_new_accounts_hash, BankIncrementalSnapshotPersistence,
                 SerdeAccountsHash, SerdeIncrementalAccountsHash, SerdeStyle, SnapshotStreams,
@@ -32,9 +31,9 @@ mod tests {
             epoch_accounts_hash::EpochAccountsHash,
             stake_rewards::StakeReward,
         },
+        solana_program_runtime::runtime_config::RuntimeConfig,
         solana_sdk::{
             epoch_schedule::EpochSchedule,
-            feature_set,
             genesis_config::create_genesis_config,
             hash::Hash,
             pubkey::Pubkey,
@@ -100,7 +99,6 @@ mod tests {
     ) {
         solana_logger::setup();
         let (mut genesis_config, _) = create_genesis_config(500);
-        activate_feature(&mut genesis_config, feature_set::epoch_accounts_hash::id());
         genesis_config.epoch_schedule = EpochSchedule::custom(400, 400, false);
         let bank0 = Arc::new(Bank::new_for_tests(&genesis_config));
         let eah_start_slot = epoch_accounts_hash_utils::calculation_start(&bank0);
@@ -109,7 +107,7 @@ mod tests {
 
         // Create an account on a non-root fork
         let key1 = Keypair::new();
-        bank1.deposit(&key1.pubkey(), 5).unwrap();
+        bank_test_utils::deposit(&bank1, &key1.pubkey(), 5).unwrap();
 
         // If setting an initial EAH, then the bank being snapshotted must be in the EAH calculation
         // window.  Otherwise `bank_to_stream()` below will *not* include the EAH in the bank snapshot,
@@ -123,11 +121,11 @@ mod tests {
 
         // Test new account
         let key2 = Keypair::new();
-        bank2.deposit(&key2.pubkey(), 10).unwrap();
+        bank_test_utils::deposit(&bank2, &key2.pubkey(), 10).unwrap();
         assert_eq!(bank2.get_balance(&key2.pubkey()), 10);
 
         let key3 = Keypair::new();
-        bank2.deposit(&key3.pubkey(), 0).unwrap();
+        bank_test_utils::deposit(&bank2, &key3.pubkey(), 0).unwrap();
 
         bank2.freeze();
         bank2.squash();
@@ -342,10 +340,7 @@ mod tests {
         for epoch_reward_status_active in [None, Some(vec![]), Some(vec![sample_rewards])] {
             let (genesis_config, _) = create_genesis_config(500);
 
-            let bank0 = Arc::new(Bank::new_for_tests_with_config(
-                &genesis_config,
-                BankTestConfig::default(),
-            ));
+            let bank0 = Arc::new(Bank::new_for_tests(&genesis_config));
             bank0.squash();
             let mut bank = Bank::new_from_parent(bank0.clone(), &Pubkey::default(), 1);
 
@@ -416,7 +411,7 @@ mod tests {
             );
 
             // assert epoch_reward_status is the same as the set epoch reward status
-            let epoch_reward_status = bank
+            let epoch_reward_status = dbank
                 .get_epoch_reward_status_to_serialize()
                 .unwrap_or(&EpochRewardStatus::Inactive);
             if let Some(rewards) = epoch_reward_status_active {
@@ -509,7 +504,7 @@ mod tests {
             );
 
             // assert epoch_reward_status is the same as the set epoch reward status
-            let epoch_reward_status = bank
+            let epoch_reward_status = dbank
                 .get_epoch_reward_status_to_serialize()
                 .unwrap_or(&EpochRewardStatus::Inactive);
             if let Some(rewards) = epoch_reward_status_active {
@@ -535,10 +530,7 @@ mod tests {
         solana_logger::setup();
         let (genesis_config, _) = create_genesis_config(500);
 
-        let bank0 = Arc::new(Bank::new_for_tests_with_config(
-            &genesis_config,
-            BankTestConfig::default(),
-        ));
+        let bank0 = Arc::new(Bank::new_for_tests(&genesis_config));
         bank0.squash();
         let mut bank = Bank::new_from_parent(bank0.clone(), &Pubkey::default(), 1);
         add_root_and_flush_write_cache(&bank0);
@@ -601,7 +593,7 @@ mod tests {
         assert_eq!(0, dbank.fee_rate_governor.lamports_per_signature);
 
         // epoch_reward status should default to `Inactive`
-        let epoch_reward_status = bank
+        let epoch_reward_status = dbank
             .get_epoch_reward_status_to_serialize()
             .unwrap_or(&EpochRewardStatus::Inactive);
         assert_matches!(epoch_reward_status, EpochRewardStatus::Inactive);
@@ -613,7 +605,7 @@ mod tests {
 
         // This some what long test harness is required to freeze the ABI of
         // Bank's serialization due to versioned nature
-        #[frozen_abi(digest = "12WNiuA7qeLU8JFweQszX5sCnCj1fYnYV4i9DeACqhQD")]
+        #[frozen_abi(digest = "7BH2s2Y1yKy396c3ixC4TTyvvpkyenAvWDSiZvY5yb7P")]
         #[derive(Serialize, AbiExample)]
         pub struct BankAbiTestWrapperNewer {
             #[serde(serialize_with = "wrapper_newer")]

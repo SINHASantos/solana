@@ -1,8 +1,9 @@
 use {
     crate::{
+        accounts_hash::AccountHash,
         append_vec::AppendVecStoredAccountMeta,
         storable_accounts::StorableAccounts,
-        tiered_storage::{hot::HotAccountMeta, readable::TieredReadableAccount},
+        tiered_storage::hot::{HotAccount, HotAccountMeta},
     },
     solana_sdk::{account::ReadableAccount, hash::Hash, pubkey::Pubkey, stake_history::Epoch},
     std::{borrow::Borrow, marker::PhantomData},
@@ -17,7 +18,7 @@ pub struct StoredAccountInfo {
 }
 
 lazy_static! {
-    static ref DEFAULT_ACCOUNT_HASH: Hash = Hash::default();
+    static ref DEFAULT_ACCOUNT_HASH: AccountHash = AccountHash(Hash::default());
 }
 
 /// Goal is to eliminate copies and data reshaping given various code paths that store accounts.
@@ -30,7 +31,7 @@ pub struct StorableAccountsWithHashesAndWriteVersions<
     'b,
     T: ReadableAccount + Sync + 'b,
     U: StorableAccounts<'a, T>,
-    V: Borrow<Hash>,
+    V: Borrow<AccountHash>,
 > {
     /// accounts to store
     /// always has pubkey and account
@@ -41,8 +42,13 @@ pub struct StorableAccountsWithHashesAndWriteVersions<
     _phantom: PhantomData<&'a T>,
 }
 
-impl<'a: 'b, 'b, T: ReadableAccount + Sync + 'b, U: StorableAccounts<'a, T>, V: Borrow<Hash>>
-    StorableAccountsWithHashesAndWriteVersions<'a, 'b, T, U, V>
+impl<
+        'a: 'b,
+        'b,
+        T: ReadableAccount + Sync + 'b,
+        U: StorableAccounts<'a, T>,
+        V: Borrow<AccountHash>,
+    > StorableAccountsWithHashesAndWriteVersions<'a, 'b, T, U, V>
 {
     /// used when accounts contains hash and write version already
     pub fn new(accounts: &'b U) -> Self {
@@ -71,7 +77,7 @@ impl<'a: 'b, 'b, T: ReadableAccount + Sync + 'b, U: StorableAccounts<'a, T>, V: 
     }
 
     /// get all account fields at 'index'
-    pub fn get(&self, index: usize) -> (Option<&T>, &Pubkey, &Hash, StoredMetaWriteVersion) {
+    pub fn get(&self, index: usize) -> (Option<&T>, &Pubkey, &AccountHash, StoredMetaWriteVersion) {
         let account = self.accounts.account_default_if_zero_lamport(index);
         let pubkey = self.accounts.pubkey(index);
         let (hash, write_version) = if self.accounts.has_hash_and_write_version() {
@@ -108,7 +114,7 @@ impl<'a: 'b, 'b, T: ReadableAccount + Sync + 'b, U: StorableAccounts<'a, T>, V: 
 #[derive(PartialEq, Eq, Debug)]
 pub enum StoredAccountMeta<'storage> {
     AppendVec(AppendVecStoredAccountMeta<'storage>),
-    Hot(TieredReadableAccount<'storage, HotAccountMeta>),
+    Hot(HotAccount<'storage, HotAccountMeta>),
 }
 
 impl<'storage> StoredAccountMeta<'storage> {
@@ -119,10 +125,11 @@ impl<'storage> StoredAccountMeta<'storage> {
         }
     }
 
-    pub fn hash(&self) -> &'storage Hash {
+    pub fn hash(&self) -> &'storage AccountHash {
         match self {
             Self::AppendVec(av) => av.hash(),
-            Self::Hot(hot) => hot.hash().unwrap_or(&DEFAULT_ACCOUNT_HASH),
+            // tiered-storage has deprecated the use of AccountHash
+            Self::Hot(_) => &DEFAULT_ACCOUNT_HASH,
         }
     }
 
@@ -136,7 +143,7 @@ impl<'storage> StoredAccountMeta<'storage> {
     pub fn offset(&self) -> usize {
         match self {
             Self::AppendVec(av) => av.offset(),
-            Self::Hot(hot) => hot.index(),
+            Self::Hot(hot) => hot.index().0 as usize,
         }
     }
 

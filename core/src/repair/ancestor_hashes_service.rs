@@ -160,6 +160,7 @@ impl AncestorHashesService {
         let outstanding_requests = Arc::<RwLock<OutstandingAncestorHashesRepairs>>::default();
         let (response_sender, response_receiver) = unbounded();
         let t_receiver = streamer::receiver(
+            "solRcvrAncHash".to_string(),
             ancestor_hashes_request_socket.clone(),
             exit.clone(),
             response_sender.clone(),
@@ -918,7 +919,10 @@ mod test {
             cluster_info::{ClusterInfo, Node},
             contact_info::{ContactInfo, Protocol},
         },
-        solana_ledger::{blockstore::make_many_slot_entries, get_tmp_ledger_path, shred::Nonce},
+        solana_ledger::{
+            blockstore::make_many_slot_entries, get_tmp_ledger_path,
+            get_tmp_ledger_path_auto_delete, shred::Nonce,
+        },
         solana_runtime::{accounts_background_service::AbsRequestSender, bank_forks::BankForks},
         solana_sdk::{
             hash::Hash,
@@ -1291,6 +1295,7 @@ mod test {
 
             // Set up repair request receiver threads
             let t_request_receiver = streamer::receiver(
+                "solRcvrTest".to_string(),
                 Arc::new(responder_node.sockets.serve_repair),
                 exit.clone(),
                 requests_sender,
@@ -1344,7 +1349,12 @@ mod test {
         fn new(bank_forks: Arc<RwLock<BankForks>>) -> Self {
             let ancestor_hashes_request_statuses = Arc::new(DashMap::new());
             let ancestor_hashes_request_socket = Arc::new(UdpSocket::bind("0.0.0.0:0").unwrap());
-            let epoch_schedule = *bank_forks.read().unwrap().root_bank().epoch_schedule();
+            let epoch_schedule = bank_forks
+                .read()
+                .unwrap()
+                .root_bank()
+                .epoch_schedule()
+                .clone();
             let keypair = Keypair::new();
             let requester_cluster_info = Arc::new(ClusterInfo::new(
                 Node::new_localhost_with_pubkey(&keypair.pubkey()).info,
@@ -1366,6 +1376,7 @@ mod test {
                 ancestor_duplicate_slots_sender,
                 repair_validators: None,
                 repair_whitelist,
+                wen_restart_repair_slots: None,
             };
 
             let (ancestor_hashes_replay_update_sender, ancestor_hashes_replay_update_receiver) =
@@ -1928,7 +1939,7 @@ mod test {
     #[test]
     fn test_verify_and_process_ancestor_responses_invalid_packet() {
         let bank0 = Bank::default_for_tests();
-        let bank_forks = Arc::new(RwLock::new(BankForks::new(bank0)));
+        let bank_forks = BankForks::new_rw_arc(bank0);
 
         let ManageAncestorHashesState {
             ancestor_hashes_request_statuses,
@@ -1938,8 +1949,8 @@ mod test {
             ..
         } = ManageAncestorHashesState::new(bank_forks);
 
-        let ledger_path = get_tmp_ledger_path!();
-        let blockstore = Blockstore::open(&ledger_path).unwrap();
+        let ledger_path = get_tmp_ledger_path_auto_delete!();
+        let blockstore = Blockstore::open(ledger_path.path()).unwrap();
 
         // Create invalid packet with fewer bytes than the size of the nonce
         let mut packet = Packet::default();

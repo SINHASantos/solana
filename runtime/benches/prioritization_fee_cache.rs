@@ -36,7 +36,7 @@ fn build_sanitized_transaction(
         Some(signer_account),
     ));
 
-    SanitizedTransaction::try_from_legacy_transaction(transaction).unwrap()
+    SanitizedTransaction::from_transaction_for_tests(transaction)
 }
 
 #[bench]
@@ -100,8 +100,8 @@ fn bench_process_transactions_multiple_slots(bencher: &mut Bencher) {
 
     let GenesisConfigInfo { genesis_config, .. } = create_genesis_config(10_000);
     let bank0 = Bank::new_for_benches(&genesis_config);
-    let bank_forks = BankForks::new(bank0);
-    let bank = bank_forks.working_bank();
+    let bank_forks = BankForks::new_rw_arc(bank0);
+    let bank = bank_forks.read().unwrap().working_bank();
     let collector = solana_sdk::pubkey::new_rand();
     let banks = (1..=NUM_SLOTS)
         .map(|n| Arc::new(Bank::new_from_parent(bank.clone(), &collector, n as u64)))

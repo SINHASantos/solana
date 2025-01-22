@@ -25,6 +25,7 @@ lazy_static = { workspace = true }
 libc = { workspace = true }
 log = { workspace = true }
 lru = { workspace = true }
+mockall = { workspace = true }
 num_cpus = { workspace = true }
 num_enum = { workspace = true }
 prost = { workspace = true }
@@ -53,6 +54,7 @@ solana-sdk = { workspace = true }
 solana-stake-program = { workspace = true }
 solana-storage-bigtable = { workspace = true }
 solana-storage-proto = { workspace = true }
+solana-svm = { workspace = true }
 solana-transaction-status = { workspace = true }
 solana-vote = { workspace = true }
 solana-vote-program = { workspace = true }

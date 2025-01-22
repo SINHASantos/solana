@@ -1,6 +1,5 @@
 use {
-    solana_accounts_db::stake_rewards::RewardInfo,
-    solana_sdk::{clock::UnixTimestamp, pubkey::Pubkey},
+    solana_sdk::{clock::UnixTimestamp, pubkey::Pubkey, reward_info::RewardInfo},
     std::sync::{Arc, RwLock},
 };
 
@@ -22,4 +21,4 @@ pub trait BlockMetadataNotifier {
     );
 }
 
-pub type BlockMetadataNotifierLock = Arc<RwLock<dyn BlockMetadataNotifier + Sync + Send>>;
+pub type BlockMetadataNotifierArc = Arc<dyn BlockMetadataNotifier + Sync + Send>;

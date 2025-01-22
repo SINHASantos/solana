@@ -32,13 +32,16 @@ use {
             CrdsFilter, CrdsTimeouts, ProcessPullStats, CRDS_GOSSIP_PULL_CRDS_TIMEOUT_MS,
         },
         crds_value::{
-            self, AccountsHashes, CrdsData, CrdsValue, CrdsValueLabel, EpochSlotsIndex, LowestSlot,
-            NodeInstance, SnapshotHashes, Version, Vote, MAX_WALLCLOCK,
+            self, CrdsData, CrdsValue, CrdsValueLabel, EpochSlotsIndex, LowestSlot, NodeInstance,
+            SnapshotHashes, Version, Vote, MAX_WALLCLOCK,
         },
         duplicate_shred::DuplicateShred,
         epoch_slots::EpochSlots,
         gossip_error::GossipError,
         ping_pong::{self, PingCache, Pong},
+        restart_crds_values::{
+            RestartHeaviestFork, RestartLastVotedForkSlots, RestartLastVotedForkSlotsError,
+        },
         socketaddr, socketaddr_any,
         weighted_shuffle::WeightedShuffle,
     },
@@ -80,7 +83,7 @@ use {
     solana_vote_program::vote_state::MAX_LOCKOUT_HISTORY,
     std::{
         borrow::Cow,
-        collections::{hash_map::Entry, HashMap, HashSet, VecDeque},
+        collections::{HashMap, HashSet, VecDeque},
         fmt::Debug,
         fs::{self, File},
         io::BufReader,
@@ -256,18 +259,10 @@ struct PullData {
     filter: CrdsFilter,
 }
 
-pub fn make_accounts_hashes_message(
-    keypair: &Keypair,
-    accounts_hashes: Vec<(Slot, Hash)>,
-) -> Option<CrdsValue> {
-    let message = CrdsData::AccountsHashes(AccountsHashes::new(keypair.pubkey(), accounts_hashes));
-    Some(CrdsValue::new_signed(message, keypair))
-}
-
 pub(crate) type Ping = ping_pong::Ping<[u8; GOSSIP_PING_TOKEN_SIZE]>;
 
 // TODO These messages should go through the gpu pipeline for spam filtering
-#[frozen_abi(digest = "CVvKB495YW6JN4w1rWwajyZmG5wvNhmD97V99rSv9fGw")]
+#[frozen_abi(digest = "ogEqvffeEkPpojAaSiUbCv2HdJcdXDQ1ykgYyvKvLo2")]
 #[derive(Serialize, Deserialize, Debug, AbiEnumVisitor, AbiExample)]
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum Protocol {
@@ -389,11 +384,11 @@ fn retain_staked(values: &mut Vec<CrdsValue>, stakes: &HashMap<Pubkey, u64>) {
             // the various dashboards.
             CrdsData::Version(_) => true,
             CrdsData::NodeInstance(_) => true,
-            // getHealth fails if account hashes are not propagated.
             CrdsData::AccountsHashes(_) => true,
             CrdsData::LowestSlot(_, _)
             | CrdsData::LegacyVersion(_)
             | CrdsData::DuplicateShred(_, _)
+            | CrdsData::RestartHeaviestFork(_)
             | CrdsData::RestartLastVotedForkSlots(_) => {
                 let stake = stakes.get(&value.pubkey()).copied();
                 stake.unwrap_or_default() >= MIN_STAKE_FOR_GOSSIP
@@ -770,7 +765,7 @@ impl ClusterInfo {
                         ""
                     },
                     now.saturating_sub(last_updated),
-                    node.pubkey(),
+                    node.pubkey().to_string(),
                     if let Some(node_version) = node_version {
                         node_version.to_string()
                     } else {
@@ -832,7 +827,7 @@ impl ClusterInfo {
                             .unwrap_or_else(|| String::from("none")),
                         if node.pubkey() == &my_pubkey { "me" } else { "" },
                         now.saturating_sub(last_updated),
-                        node.pubkey(),
+                        node.pubkey().to_string(),
                         if let Some(node_version) = node_version {
                             node_version.to_string()
                         } else {
@@ -854,7 +849,7 @@ impl ClusterInfo {
         format!(
             "IP Address        |Age(ms)| Node identifier                              \
              | Version |Gossip|TPUvote| TPU  |TPUfwd| TVU  |TVU Q |ServeR|ShredVer\n\
-             ------------------+-------+---------------------------------------\
+             ------------------+-------+----------------------------------------------\
              +---------+------+-------+------+------+------+------+------+--------\n\
              {}\
              Nodes: {}{}{}",
@@ -889,10 +884,7 @@ impl ClusterInfo {
                 CrdsData::LowestSlot(0, LowestSlot::new(self_pubkey, min, now)),
                 &self.keypair(),
             );
-            self.local_message_pending_push_queue
-                .lock()
-                .unwrap()
-                .push(entry);
+            self.push_message(entry);
         }
     }
 
@@ -965,6 +957,46 @@ impl ClusterInfo {
         }
     }
 
+    pub fn push_restart_last_voted_fork_slots(
+        &self,
+        fork: &[Slot],
+        last_vote_bankhash: Hash,
+    ) -> Result<(), RestartLastVotedForkSlotsError> {
+        let now = timestamp();
+        let last_voted_fork_slots = RestartLastVotedForkSlots::new(
+            self.id(),
+            now,
+            fork,
+            last_vote_bankhash,
+            self.my_shred_version(),
+        )?;
+        self.push_message(CrdsValue::new_signed(
+            CrdsData::RestartLastVotedForkSlots(last_voted_fork_slots),
+            &self.keypair(),
+        ));
+        Ok(())
+    }
+
+    pub fn push_restart_heaviest_fork(
+        &self,
+        last_slot: Slot,
+        last_slot_hash: Hash,
+        observed_stake: u64,
+    ) {
+        let restart_heaviest_fork = RestartHeaviestFork {
+            from: self.id(),
+            wallclock: timestamp(),
+            last_slot,
+            last_slot_hash,
+            observed_stake,
+            shred_version: self.my_shred_version(),
+        };
+        self.push_message(CrdsValue::new_signed(
+            CrdsData::RestartHeaviestFork(restart_heaviest_fork),
+            &self.keypair(),
+        ));
+    }
+
     fn time_gossip_read_lock<'a>(
         &'a self,
         label: &'static str,
@@ -973,24 +1005,11 @@ impl ClusterInfo {
         TimedGuard::new(self.gossip.crds.read().unwrap(), label, counter)
     }
 
-    pub fn push_message(&self, message: CrdsValue) {
+    fn push_message(&self, message: CrdsValue) {
         self.local_message_pending_push_queue
             .lock()
             .unwrap()
             .push(message);
-    }
-
-    pub fn push_accounts_hashes(&self, accounts_hashes: Vec<(Slot, Hash)>) {
-        if accounts_hashes.len() > MAX_ACCOUNTS_HASHES {
-            warn!(
-                "accounts hashes too large, ignored: {}",
-                accounts_hashes.len(),
-            );
-            return;
-        }
-
-        let message = CrdsData::AccountsHashes(AccountsHashes::new(self.id(), accounts_hashes));
-        self.push_message(CrdsValue::new_signed(message, &self.keypair()));
     }
 
     pub fn push_snapshot_hashes(
@@ -1180,16 +1199,6 @@ impl ClusterInfo {
         Ok(())
     }
 
-    pub fn get_accounts_hash_for_node<F, Y>(&self, pubkey: &Pubkey, map: F) -> Option<Y>
-    where
-        F: FnOnce(&Vec<(Slot, Hash)>) -> Y,
-    {
-        self.time_gossip_read_lock("get_accounts_hash", &self.stats.get_accounts_hash)
-            .get::<&CrdsValue>(&CrdsValueLabel::AccountsHashes(*pubkey))
-            .map(|x| &x.accounts_hash().unwrap().hashes)
-            .map(map)
-    }
-
     pub fn get_snapshot_hashes_for_node(&self, pubkey: &Pubkey) -> Option<SnapshotHashes> {
         self.gossip
             .crds
@@ -1200,7 +1209,7 @@ impl ClusterInfo {
     }
 
     /// Returns epoch-slots inserted since the given cursor.
-    /// Excludes entries from nodes with unkown or different shred version.
+    /// Excludes entries from nodes with unknown or different shred version.
     pub fn get_epoch_slots(&self, cursor: &mut Cursor) -> Vec<EpochSlots> {
         let self_shred_version = Some(self.my_shred_version());
         let gossip_crds = self.gossip.crds.read().unwrap();
@@ -1214,6 +1223,39 @@ impl ClusterInfo {
                 CrdsData::EpochSlots(_, slots) => slots.clone(),
                 _ => panic!("this should not happen!"),
             })
+            .collect()
+    }
+
+    pub fn get_restart_last_voted_fork_slots(
+        &self,
+        cursor: &mut Cursor,
+    ) -> Vec<RestartLastVotedForkSlots> {
+        let self_shred_version = self.my_shred_version();
+        let gossip_crds = self.gossip.crds.read().unwrap();
+        gossip_crds
+            .get_entries(cursor)
+            .filter_map(|entry| {
+                let CrdsData::RestartLastVotedForkSlots(slots) = &entry.value.data else {
+                    return None;
+                };
+                (slots.shred_version == self_shred_version).then_some(slots)
+            })
+            .cloned()
+            .collect()
+    }
+
+    pub fn get_restart_heaviest_fork(&self, cursor: &mut Cursor) -> Vec<RestartHeaviestFork> {
+        let self_shred_version = self.my_shred_version();
+        let gossip_crds = self.gossip.crds.read().unwrap();
+        gossip_crds
+            .get_entries(cursor)
+            .filter_map(|entry| {
+                let CrdsData::RestartHeaviestFork(fork) = &entry.value.data else {
+                    return None;
+                };
+                (fork.shred_version == self_shred_version).then_some(fork)
+            })
+            .cloned()
             .collect()
     }
 
@@ -1515,25 +1557,23 @@ impl ClusterInfo {
         (pings, pulls.collect())
     }
 
-    fn drain_push_queue(&self) -> Vec<CrdsValue> {
-        let mut push_queue = self.local_message_pending_push_queue.lock().unwrap();
-        std::mem::take(&mut *push_queue)
-    }
-    // Used in tests
     pub fn flush_push_queue(&self) {
-        let pending_push_messages = self.drain_push_queue();
-        let mut gossip_crds = self.gossip.crds.write().unwrap();
-        let now = timestamp();
-        for entry in pending_push_messages {
-            let _ = gossip_crds.insert(entry, now, GossipRoute::LocalMessage);
+        let entries: Vec<CrdsValue> =
+            std::mem::take(&mut *self.local_message_pending_push_queue.lock().unwrap());
+        if !entries.is_empty() {
+            let mut gossip_crds = self.gossip.crds.write().unwrap();
+            let now = timestamp();
+            for entry in entries {
+                let _ = gossip_crds.insert(entry, now, GossipRoute::LocalMessage);
+            }
         }
     }
     fn new_push_requests(&self, stakes: &HashMap<Pubkey, u64>) -> Vec<(SocketAddr, Protocol)> {
         let self_id = self.id();
         let (mut push_messages, num_entries, num_nodes) = {
             let _st = ScopedTimer::from(&self.stats.new_push_requests);
-            self.gossip
-                .new_push_messages(&self_id, self.drain_push_queue(), timestamp(), stakes)
+            self.flush_push_queue();
+            self.gossip.new_push_messages(&self_id, timestamp(), stakes)
         };
         self.stats
             .push_fanout_num_entries
@@ -1718,7 +1758,7 @@ impl ClusterInfo {
         match gossip_crds.trim(cap, &keep, stakes, timestamp()) {
             Err(err) => {
                 self.stats.trim_crds_table_failed.add_relaxed(1);
-                // TODO: Stakes are comming from the root-bank. Debug why/when
+                // TODO: Stakes are coming from the root-bank. Debug why/when
                 // they are empty/zero.
                 debug!("crds table trim failed: {:?}", err);
             }
@@ -2051,7 +2091,7 @@ impl ClusterInfo {
                     score
                 };
                 let score = match response.data {
-                    CrdsData::LegacyContactInfo(_) => 2 * score,
+                    CrdsData::LegacyContactInfo(_) | CrdsData::ContactInfo(_) => 2 * score,
                     _ => score,
                 };
                 ((addr, response), score)
@@ -2101,77 +2141,27 @@ impl ClusterInfo {
 
     fn handle_batch_pull_responses(
         &self,
-        responses: Vec<(Pubkey, Vec<CrdsValue>)>,
-        thread_pool: &ThreadPool,
+        responses: Vec<CrdsValue>,
         stakes: &HashMap<Pubkey, u64>,
         epoch_duration: Duration,
     ) {
         let _st = ScopedTimer::from(&self.stats.handle_batch_pull_responses_time);
-        if responses.is_empty() {
-            return;
-        }
-        fn extend<K, V>(hash_map: &mut HashMap<K, Vec<V>>, (key, mut value): (K, Vec<V>))
-        where
-            K: Eq + std::hash::Hash,
-        {
-            match hash_map.entry(key) {
-                Entry::Occupied(mut entry) => {
-                    let entry_value = entry.get_mut();
-                    if entry_value.len() < value.len() {
-                        std::mem::swap(entry_value, &mut value);
-                    }
-                    entry_value.extend(value);
-                }
-                Entry::Vacant(entry) => {
-                    entry.insert(value);
-                }
-            }
-        }
-        fn merge<K, V>(
-            mut hash_map: HashMap<K, Vec<V>>,
-            other: HashMap<K, Vec<V>>,
-        ) -> HashMap<K, Vec<V>>
-        where
-            K: Eq + std::hash::Hash,
-        {
-            if hash_map.len() < other.len() {
-                return merge(other, hash_map);
-            }
-            for kv in other {
-                extend(&mut hash_map, kv);
-            }
-            hash_map
-        }
-        let responses = thread_pool.install(|| {
-            responses
-                .into_par_iter()
-                .with_min_len(1024)
-                .fold(HashMap::new, |mut hash_map, kv| {
-                    extend(&mut hash_map, kv);
-                    hash_map
-                })
-                .reduce(HashMap::new, merge)
-        });
         if !responses.is_empty() {
             let self_pubkey = self.id();
             let timeouts = self
                 .gossip
                 .make_timeouts(self_pubkey, stakes, epoch_duration);
-            for (from, data) in responses {
-                self.handle_pull_response(&from, data, &timeouts);
-            }
+            self.handle_pull_response(responses, &timeouts);
         }
     }
 
     // Returns (failed, timeout, success)
     fn handle_pull_response(
         &self,
-        from: &Pubkey,
         crds_values: Vec<CrdsValue>,
         timeouts: &CrdsTimeouts,
     ) -> (usize, usize, usize) {
         let len = crds_values.len();
-        trace!("PullResponse me: {} from: {} len={}", self.id(), from, len);
         let mut pull_stats = ProcessPullStats::default();
         let (filtered_pulls, filtered_pulls_expired_timeout, failed_inserts) = {
             let _st = ScopedTimer::from(&self.stats.filter_pull_response);
@@ -2446,9 +2436,9 @@ impl ClusterInfo {
                 Protocol::PullRequest(filter, caller) => {
                     pull_requests.push((from_addr, filter, caller))
                 }
-                Protocol::PullResponse(from, data) => {
+                Protocol::PullResponse(_, mut data) => {
                     check_duplicate_instance(&data)?;
-                    pull_responses.push((from, data));
+                    pull_responses.append(&mut data);
                 }
                 Protocol::PushMessage(from, data) => {
                     check_duplicate_instance(&data)?;
@@ -2460,13 +2450,10 @@ impl ClusterInfo {
             }
         }
         if self.require_stake_for_gossip(stakes) {
-            for (_, data) in &mut pull_responses {
-                retain_staked(data, stakes);
-            }
+            retain_staked(&mut pull_responses, stakes);
             for (_, data) in &mut push_messages {
                 retain_staked(data, stakes);
             }
-            pull_responses.retain(|(_, data)| !data.is_empty());
             push_messages.retain(|(_, data)| !data.is_empty());
         }
         self.handle_batch_ping_messages(ping_messages, recycler, response_sender);
@@ -2478,7 +2465,7 @@ impl ClusterInfo {
             stakes,
             response_sender,
         );
-        self.handle_batch_pull_responses(pull_responses, thread_pool, stakes, epoch_duration);
+        self.handle_batch_pull_responses(pull_responses, stakes, epoch_duration);
         self.trim_crds_table(CRDS_UNIQUE_PUBKEY_CAPACITY, stakes);
         self.handle_batch_pong_messages(pong_messages, Instant::now());
         self.handle_batch_pull_requests(
@@ -3099,6 +3086,7 @@ fn filter_on_shred_version(
         if crds.get_shred_version(from) == Some(self_shred_version) {
             values.retain(|value| match &value.data {
                 // Allow contact-infos so that shred-versions are updated.
+                CrdsData::ContactInfo(_) => true,
                 CrdsData::LegacyContactInfo(_) => true,
                 CrdsData::NodeInstance(_) => true,
                 // Only retain values with the same shred version.
@@ -3108,6 +3096,7 @@ fn filter_on_shred_version(
             values.retain(|value| match &value.data {
                 // Allow node to update its own contact info in case their
                 // shred-version changes
+                CrdsData::ContactInfo(node) => node.pubkey() == from,
                 CrdsData::LegacyContactInfo(node) => node.pubkey() == from,
                 CrdsData::NodeInstance(_) => true,
                 _ => false,
@@ -3122,6 +3111,11 @@ fn filter_on_shred_version(
         Protocol::PullRequest(_, caller) => match &caller.data {
             // Allow spy nodes with shred-verion == 0 to pull from other nodes.
             CrdsData::LegacyContactInfo(node)
+                if node.shred_version() == 0 || node.shred_version() == self_shred_version =>
+            {
+                Some(msg)
+            }
+            CrdsData::ContactInfo(node)
                 if node.shred_version() == 0 || node.shred_version() == self_shred_version =>
             {
                 Some(msg)
@@ -3159,7 +3153,7 @@ mod tests {
         super::*,
         crate::{
             crds_gossip_pull::tests::MIN_NUM_BLOOM_FILTERS,
-            crds_value::{CrdsValue, CrdsValueLabel, Vote as CrdsVote},
+            crds_value::{AccountsHashes, CrdsValue, CrdsValueLabel, Vote as CrdsVote},
             duplicate_shred::{self, tests::new_rand_shred, MAX_DUPLICATE_SHREDS},
         },
         itertools::izip,
@@ -3212,18 +3206,11 @@ mod tests {
         );
         assert_eq!(
             (0, 0, 1),
-            ClusterInfo::handle_pull_response(
-                &cluster_info,
-                &entrypoint_pubkey,
-                data.clone(),
-                &timeouts
-            )
+            cluster_info.handle_pull_response(data.clone(), &timeouts)
         );
-
-        let entrypoint_pubkey2 = solana_sdk::pubkey::new_rand();
         assert_eq!(
             (1, 0, 0),
-            ClusterInfo::handle_pull_response(&cluster_info, &entrypoint_pubkey2, data, &timeouts)
+            cluster_info.handle_pull_response(data, &timeouts)
         );
     }
 
@@ -3656,12 +3643,11 @@ mod tests {
             &SocketAddrSpace::Unspecified,
         );
         //check that all types of gossip messages are signed correctly
-        let (push_messages, _, _) = cluster_info.gossip.new_push_messages(
-            &cluster_info.id(),
-            cluster_info.drain_push_queue(),
-            timestamp(),
-            &stakes,
-        );
+        cluster_info.flush_push_queue();
+        let (push_messages, _, _) =
+            cluster_info
+                .gossip
+                .new_push_messages(&cluster_info.id(), timestamp(), &stakes);
         // there should be some pushes ready
         assert!(!push_messages.is_empty());
         push_messages
@@ -3981,12 +3967,7 @@ mod tests {
             &stakes,
             Duration::from_millis(cluster_info.gossip.pull.crds_timeout),
         );
-        ClusterInfo::handle_pull_response(
-            &cluster_info,
-            &entrypoint_pubkey,
-            vec![entrypoint_crdsvalue],
-            &timeouts,
-        );
+        cluster_info.handle_pull_response(vec![entrypoint_crdsvalue], &timeouts);
         let (pings, pulls) = cluster_info.new_pull_requests(&thread_pool, None, &HashMap::new());
         assert_eq!(pings.len(), 1);
         assert_eq!(pulls.len(), MIN_NUM_BLOOM_FILTERS);
@@ -4495,7 +4476,7 @@ mod tests {
         );
         assert_eq!(
             (0, 0, NO_ENTRIES),
-            cluster_info.handle_pull_response(&entrypoint_pubkey, data, &timeouts)
+            cluster_info.handle_pull_response(data, &timeouts)
         );
     }
 
@@ -4557,5 +4538,201 @@ mod tests {
             assert_eq!(shred_data.slot, 53084025);
             assert_eq!(shred_data.chunk_index() as usize, i);
         }
+    }
+
+    #[test]
+    fn test_push_restart_last_voted_fork_slots() {
+        let keypair = Arc::new(Keypair::new());
+        let contact_info = ContactInfo::new_localhost(&keypair.pubkey(), 0);
+        let cluster_info = ClusterInfo::new(contact_info, keypair, SocketAddrSpace::Unspecified);
+        let slots = cluster_info.get_restart_last_voted_fork_slots(&mut Cursor::default());
+        assert!(slots.is_empty());
+        let mut update: Vec<Slot> = vec![0];
+        for i in 0..81 {
+            for j in 0..1000 {
+                update.push(i * 1050 + j);
+            }
+        }
+        assert!(cluster_info
+            .push_restart_last_voted_fork_slots(&update, Hash::default())
+            .is_ok());
+        cluster_info.flush_push_queue();
+
+        let mut cursor = Cursor::default();
+        let slots = cluster_info.get_restart_last_voted_fork_slots(&mut cursor);
+        assert_eq!(slots.len(), 1);
+        let retrieved_slots = slots[0].to_slots(0);
+        assert!(retrieved_slots[0] < 69000);
+        assert_eq!(retrieved_slots.last(), Some(84999).as_ref());
+
+        let slots = cluster_info.get_restart_last_voted_fork_slots(&mut cursor);
+        assert!(slots.is_empty());
+
+        // Test with different shred versions.
+        let mut rng = rand::thread_rng();
+        let node_pubkey = Pubkey::new_unique();
+        let mut node = LegacyContactInfo::new_rand(&mut rng, Some(node_pubkey));
+        node.set_shred_version(42);
+        let mut slots = RestartLastVotedForkSlots::new_rand(&mut rng, Some(node_pubkey));
+        slots.shred_version = 42;
+        let entries = vec![
+            CrdsValue::new_unsigned(CrdsData::LegacyContactInfo(node)),
+            CrdsValue::new_unsigned(CrdsData::RestartLastVotedForkSlots(slots)),
+        ];
+        {
+            let mut gossip_crds = cluster_info.gossip.crds.write().unwrap();
+            for entry in entries {
+                assert!(gossip_crds
+                    .insert(entry, /*now=*/ 0, GossipRoute::LocalMessage)
+                    .is_ok());
+            }
+        }
+        // Should exclude other node's last-voted-fork-slot because of different
+        // shred-version.
+        let slots = cluster_info.get_restart_last_voted_fork_slots(&mut Cursor::default());
+        assert_eq!(slots.len(), 1);
+        assert_eq!(slots[0].from, cluster_info.id());
+
+        // Match shred versions.
+        {
+            let mut node = cluster_info.my_contact_info.write().unwrap();
+            node.set_shred_version(42);
+        }
+        assert!(cluster_info
+            .push_restart_last_voted_fork_slots(&update, Hash::default())
+            .is_ok());
+        cluster_info.flush_push_queue();
+        // Should now include both slots.
+        let slots = cluster_info.get_restart_last_voted_fork_slots(&mut Cursor::default());
+        assert_eq!(slots.len(), 2);
+        assert_eq!(slots[0].from, node_pubkey);
+        assert_eq!(slots[1].from, cluster_info.id());
+    }
+
+    #[test]
+    fn test_push_restart_heaviest_fork() {
+        solana_logger::setup();
+        let keypair = Arc::new(Keypair::new());
+        let pubkey = keypair.pubkey();
+        let contact_info = ContactInfo::new_localhost(&pubkey, 0);
+        let cluster_info = ClusterInfo::new(contact_info, keypair, SocketAddrSpace::Unspecified);
+
+        // make sure empty crds is handled correctly
+        let mut cursor = Cursor::default();
+        let heaviest_forks = cluster_info.get_restart_heaviest_fork(&mut cursor);
+        assert_eq!(heaviest_forks, vec![]);
+
+        // add new message
+        let slot1 = 53;
+        let hash1 = Hash::new_unique();
+        let stake1 = 15_000_000;
+        cluster_info.push_restart_heaviest_fork(slot1, hash1, stake1);
+        cluster_info.flush_push_queue();
+
+        let heaviest_forks = cluster_info.get_restart_heaviest_fork(&mut cursor);
+        assert_eq!(heaviest_forks.len(), 1);
+        let fork = &heaviest_forks[0];
+        assert_eq!(fork.last_slot, slot1);
+        assert_eq!(fork.last_slot_hash, hash1);
+        assert_eq!(fork.observed_stake, stake1);
+        assert_eq!(fork.from, pubkey);
+
+        // Test with different shred versions.
+        let mut rng = rand::thread_rng();
+        let pubkey2 = Pubkey::new_unique();
+        let mut new_node = LegacyContactInfo::new_rand(&mut rng, Some(pubkey2));
+        new_node.set_shred_version(42);
+        let slot2 = 54;
+        let hash2 = Hash::new_unique();
+        let stake2 = 23_000_000;
+        let entries = vec![
+            CrdsValue::new_unsigned(CrdsData::LegacyContactInfo(new_node)),
+            CrdsValue::new_unsigned(CrdsData::RestartHeaviestFork(RestartHeaviestFork {
+                from: pubkey2,
+                wallclock: timestamp(),
+                last_slot: slot2,
+                last_slot_hash: hash2,
+                observed_stake: stake2,
+                shred_version: 42,
+            })),
+        ];
+        {
+            let mut gossip_crds = cluster_info.gossip.crds.write().unwrap();
+            for entry in entries {
+                assert!(gossip_crds
+                    .insert(entry, /*now=*/ 0, GossipRoute::LocalMessage)
+                    .is_ok());
+            }
+        }
+        // Should exclude other node's heaviest_fork because of different
+        // shred-version.
+        let heaviest_forks = cluster_info.get_restart_heaviest_fork(&mut Cursor::default());
+        assert_eq!(heaviest_forks.len(), 1);
+        assert_eq!(heaviest_forks[0].from, pubkey);
+        // Match shred versions.
+        {
+            let mut node = cluster_info.my_contact_info.write().unwrap();
+            node.set_shred_version(42);
+        }
+        cluster_info.push_self();
+        cluster_info.flush_push_queue();
+
+        // Should now include the previous heaviest_fork from the other node.
+        let heaviest_forks = cluster_info.get_restart_heaviest_fork(&mut Cursor::default());
+        assert_eq!(heaviest_forks.len(), 1);
+        assert_eq!(heaviest_forks[0].from, pubkey2);
+    }
+
+    #[test]
+    fn test_contact_trace() {
+        solana_logger::setup();
+        let keypair43 = Arc::new(
+            Keypair::from_bytes(&[
+                198, 203, 8, 178, 196, 71, 119, 152, 31, 96, 221, 142, 115, 224, 45, 34, 173, 138,
+                254, 39, 181, 238, 168, 70, 183, 47, 210, 91, 221, 179, 237, 153, 14, 58, 154, 59,
+                67, 220, 235, 106, 241, 99, 4, 72, 60, 245, 53, 30, 225, 122, 145, 225, 8, 40, 30,
+                174, 26, 228, 125, 127, 125, 21, 96, 28,
+            ])
+            .unwrap(),
+        );
+        let keypair44 = Arc::new(
+            Keypair::from_bytes(&[
+                66, 88, 3, 70, 228, 215, 125, 64, 130, 183, 180, 98, 22, 166, 201, 234, 89, 80,
+                135, 24, 228, 35, 20, 52, 105, 130, 50, 51, 46, 229, 244, 108, 70, 57, 45, 247, 57,
+                177, 39, 126, 190, 238, 50, 96, 186, 208, 28, 168, 148, 56, 9, 106, 92, 213, 63,
+                205, 252, 225, 244, 101, 77, 182, 4, 2,
+            ])
+            .unwrap(),
+        );
+
+        let cluster_info44 = Arc::new({
+            let mut node = Node::new_localhost_with_pubkey(&keypair44.pubkey());
+            node.sockets.gossip = UdpSocket::bind("127.0.0.1:65534").unwrap();
+            info!("{:?}", node);
+            ClusterInfo::new(node.info, keypair44.clone(), SocketAddrSpace::Unspecified)
+        });
+        let cluster_info43 = Arc::new({
+            let node = Node::new_localhost_with_pubkey(&keypair43.pubkey());
+            ClusterInfo::new(node.info, keypair43.clone(), SocketAddrSpace::Unspecified)
+        });
+
+        assert_eq!(keypair43.pubkey().to_string().len(), 43);
+        assert_eq!(keypair44.pubkey().to_string().len(), 44);
+
+        let trace = cluster_info44.contact_info_trace();
+        info!("cluster:\n{}", trace);
+        assert_eq!(trace.len(), 431);
+
+        let trace = cluster_info44.rpc_info_trace();
+        info!("rpc:\n{}", trace);
+        assert_eq!(trace.len(), 335);
+
+        let trace = cluster_info43.contact_info_trace();
+        info!("cluster:\n{}", trace);
+        assert_eq!(trace.len(), 431);
+
+        let trace = cluster_info43.rpc_info_trace();
+        info!("rpc:\n{}", trace);
+        assert_eq!(trace.len(), 335);
     }
 }

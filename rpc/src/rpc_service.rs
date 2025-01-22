@@ -6,8 +6,9 @@ use {
         max_slots::MaxSlots,
         optimistically_confirmed_bank_tracker::OptimisticallyConfirmedBank,
         rpc::{
-            rpc_accounts::*, rpc_accounts_scan::*, rpc_bank::*, rpc_deprecated_v1_7::*,
-            rpc_deprecated_v1_9::*, rpc_full::*, rpc_minimal::*, rpc_obsolete_v1_7::*, *,
+            rpc_accounts::*, rpc_accounts_scan::*, rpc_bank::*, rpc_deprecated_v1_18::*,
+            rpc_deprecated_v1_7::*, rpc_deprecated_v1_9::*, rpc_full::*, rpc_minimal::*,
+            rpc_obsolete_v1_7::*, *,
         },
         rpc_cache::LargestAccountsCache,
         rpc_health::*,
@@ -406,6 +407,7 @@ impl JsonRpcService {
                 ref bigtable_instance_name,
                 ref bigtable_app_profile_id,
                 timeout,
+                max_message_size,
             }) = config.rpc_bigtable_config
             {
                 let bigtable_config = solana_storage_bigtable::LedgerStorageConfig {
@@ -414,6 +416,7 @@ impl JsonRpcService {
                     credential_type: CredentialType::Filepath(None),
                     instance_name: bigtable_instance_name.clone(),
                     app_profile_id: bigtable_app_profile_id.clone(),
+                    max_message_size,
                 };
                 runtime
                     .block_on(solana_storage_bigtable::LedgerStorage::new_with_config(
@@ -508,6 +511,7 @@ impl JsonRpcService {
                     io.extend_with(rpc_full::FullImpl.to_delegate());
                     io.extend_with(rpc_deprecated_v1_7::DeprecatedV1_7Impl.to_delegate());
                     io.extend_with(rpc_deprecated_v1_9::DeprecatedV1_9Impl.to_delegate());
+                    io.extend_with(rpc_deprecated_v1_18::DeprecatedV1_18Impl.to_delegate());
                 }
                 if obsolete_v1_7_api {
                     io.extend_with(rpc_obsolete_v1_7::ObsoleteV1_7Impl.to_delegate());
@@ -521,7 +525,14 @@ impl JsonRpcService {
                 );
                 let server = ServerBuilder::with_meta_extractor(
                     io,
-                    move |_req: &hyper::Request<hyper::Body>| request_processor.clone(),
+                    move |req: &hyper::Request<hyper::Body>| {
+                        let xbigtable = req.headers().get("x-bigtable");
+                        if xbigtable.is_some_and(|v| v == "disabled") {
+                            request_processor.clone_without_bigtable()
+                        } else {
+                            request_processor.clone()
+                        }
+                    },
                 )
                 .event_loop_executor(runtime.handle().clone())
                 .threads(1)
@@ -586,7 +597,7 @@ mod tests {
         crate::rpc::{create_validator_exit, tests::new_test_cluster_info},
         solana_ledger::{
             genesis_utils::{create_genesis_config, GenesisConfigInfo},
-            get_tmp_ledger_path,
+            get_tmp_ledger_path_auto_delete,
         },
         solana_rpc_client_api::config::RpcContextConfig,
         solana_runtime::bank::Bank,
@@ -617,9 +628,9 @@ mod tests {
             ip_addr,
             solana_net_utils::find_available_port_in_range(ip_addr, (10000, 65535)).unwrap(),
         );
-        let bank_forks = Arc::new(RwLock::new(BankForks::new(bank)));
-        let ledger_path = get_tmp_ledger_path!();
-        let blockstore = Arc::new(Blockstore::open(&ledger_path).unwrap());
+        let bank_forks = BankForks::new_rw_arc(bank);
+        let ledger_path = get_tmp_ledger_path_auto_delete!();
+        let blockstore = Arc::new(Blockstore::open(ledger_path.path()).unwrap());
         let block_commitment_cache = Arc::new(RwLock::new(BlockCommitmentCache::default()));
         let optimistically_confirmed_bank =
             OptimisticallyConfirmedBank::locked_from_bank_forks_root(&bank_forks);
@@ -674,7 +685,7 @@ mod tests {
         } = create_genesis_config(10_000);
         genesis_config.cluster_type = ClusterType::MainnetBeta;
         let bank = Bank::new_for_tests(&genesis_config);
-        Arc::new(RwLock::new(BankForks::new(bank)))
+        BankForks::new_rw_arc(bank)
     }
 
     #[test]
@@ -719,8 +730,8 @@ mod tests {
 
     #[test]
     fn test_is_file_get_path() {
-        let ledger_path = get_tmp_ledger_path!();
-        let blockstore = Arc::new(Blockstore::open(&ledger_path).unwrap());
+        let ledger_path = get_tmp_ledger_path_auto_delete!();
+        let blockstore = Arc::new(Blockstore::open(ledger_path.path()).unwrap());
         let bank_forks = create_bank_forks();
         let optimistically_confirmed_bank =
             OptimisticallyConfirmedBank::locked_from_bank_forks_root(&bank_forks);
@@ -728,13 +739,13 @@ mod tests {
 
         let bank_forks = create_bank_forks();
         let rrm = RpcRequestMiddleware::new(
-            ledger_path.clone(),
+            ledger_path.path().to_path_buf(),
             None,
             bank_forks.clone(),
             health.clone(),
         );
         let rrm_with_snapshot_config = RpcRequestMiddleware::new(
-            ledger_path.clone(),
+            ledger_path.path().to_path_buf(),
             Some(SnapshotConfig::default()),
             bank_forks,
             health,
@@ -829,15 +840,14 @@ mod tests {
     fn test_process_file_get() {
         let runtime = Runtime::new().unwrap();
 
-        let ledger_path = get_tmp_ledger_path!();
-        let blockstore = Arc::new(Blockstore::open(&ledger_path).unwrap());
-        let genesis_path = ledger_path.join(DEFAULT_GENESIS_ARCHIVE);
+        let ledger_path = get_tmp_ledger_path_auto_delete!();
+        let blockstore = Arc::new(Blockstore::open(ledger_path.path()).unwrap());
+        let genesis_path = ledger_path.path().join(DEFAULT_GENESIS_ARCHIVE);
         let bank_forks = create_bank_forks();
         let optimistically_confirmed_bank =
             OptimisticallyConfirmedBank::locked_from_bank_forks_root(&bank_forks);
-
         let rrm = RpcRequestMiddleware::new(
-            ledger_path.clone(),
+            ledger_path.path().to_path_buf(),
             None,
             bank_forks,
             RpcHealth::stub(optimistically_confirmed_bank, blockstore),
@@ -868,24 +878,21 @@ mod tests {
             panic!("Unexpected RequestMiddlewareAction variant");
         }
 
-        #[cfg(unix)]
+        std::fs::remove_file(&genesis_path).unwrap();
         {
-            std::fs::remove_file(&genesis_path).unwrap();
-            {
-                let mut file = std::fs::File::create(ledger_path.join("wrong")).unwrap();
-                file.write_all(b"wrong file").unwrap();
-            }
-            symlink::symlink_file("wrong", &genesis_path).unwrap();
+            let mut file = std::fs::File::create(ledger_path.path().join("wrong")).unwrap();
+            file.write_all(b"wrong file").unwrap();
+        }
+        symlink::symlink_file("wrong", &genesis_path).unwrap();
 
-            // File is a symbolic link => request should fail.
-            let action = rrm.process_file_get(DEFAULT_GENESIS_DOWNLOAD_PATH);
-            if let RequestMiddlewareAction::Respond { response, .. } = action {
-                let response = runtime.block_on(response);
-                let response = response.unwrap();
-                assert_ne!(response.status(), 200);
-            } else {
-                panic!("Unexpected RequestMiddlewareAction variant");
-            }
+        // File is a symbolic link => request should fail.
+        let action = rrm.process_file_get(DEFAULT_GENESIS_DOWNLOAD_PATH);
+        if let RequestMiddlewareAction::Respond { response, .. } = action {
+            let response = runtime.block_on(response);
+            let response = response.unwrap();
+            assert_ne!(response.status(), 200);
+        } else {
+            panic!("Unexpected RequestMiddlewareAction variant");
         }
     }
 }

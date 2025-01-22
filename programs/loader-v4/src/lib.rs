@@ -12,14 +12,15 @@ use {
     },
     solana_rbpf::{
         aligned_memory::AlignedMemory,
-        ebpf,
-        elf::{Executable, FunctionRegistry},
+        declare_builtin_function, ebpf,
+        elf::Executable,
+        error::ProgramResult,
         memory_region::{MemoryMapping, MemoryRegion},
-        vm::{BuiltinProgram, Config, ContextObject, EbpfVm, ProgramResult},
+        program::{BuiltinProgram, FunctionRegistry},
+        vm::{Config, ContextObject, EbpfVm},
     },
     solana_sdk::{
         entrypoint::SUCCESS,
-        feature_set,
         instruction::InstructionError,
         loader_v4::{self, LoaderV4State, LoaderV4Status, DEPLOYMENT_COOLDOWN_IN_SLOTS},
         loader_v4_instruction::LoaderV4Instruction,
@@ -81,7 +82,6 @@ pub fn create_program_runtime_environment_v2<'a>(
         reject_broken_elfs: true,
         noop_instruction_rate: 256,
         sanitize_user_provided_values: true,
-        encrypt_runtime_environment: true,
         external_internal_function_hash_collision: true,
         reject_callx_r10: true,
         enable_sbpf_v1: false,
@@ -131,7 +131,7 @@ pub fn create_vm<'a, 'b>(
         Box::new(InstructionError::ProgramEnvironmentSetupFailure)
     })?;
     Ok(EbpfVm::new(
-        config,
+        program.get_loader().clone(),
         sbpf_version,
         invoke_context,
         memory_mapping,
@@ -182,9 +182,9 @@ fn execute<'a, 'b: 'a>(
     match result {
         ProgramResult::Ok(status) if status != SUCCESS => {
             let error: InstructionError = status.into();
-            Err(Box::new(error) as Box<dyn std::error::Error>)
+            Err(error.into())
         }
-        ProgramResult::Err(error) => Err(error),
+        ProgramResult::Err(error) => Err(error.into()),
         _ => Ok(()),
     }
 }
@@ -418,7 +418,6 @@ pub fn process_instruction_deploy(
             .clone(),
         deployment_slot,
         effective_slot,
-        None,
         programdata,
         buffer.get_data().len(),
         &mut load_program_metrics,
@@ -464,6 +463,7 @@ pub fn process_instruction_retract(
     let transaction_context = &invoke_context.transaction_context;
     let instruction_context = transaction_context.get_current_instruction_context()?;
     let mut program = instruction_context.try_borrow_instruction_account(transaction_context, 0)?;
+
     let authority_address = instruction_context
         .get_index_of_instruction_account_in_transaction(1)
         .and_then(|index| transaction_context.get_key_of_account_at_index(index))?;
@@ -527,18 +527,20 @@ pub fn process_instruction_transfer_authority(
     Ok(())
 }
 
-pub fn process_instruction(
-    invoke_context: &mut InvokeContext,
-    _arg0: u64,
-    _arg1: u64,
-    _arg2: u64,
-    _arg3: u64,
-    _arg4: u64,
-    _memory_mapping: &mut MemoryMapping,
-    result: &mut ProgramResult,
-) {
-    *result = process_instruction_inner(invoke_context).into();
-}
+declare_builtin_function!(
+    Entrypoint,
+    fn rust(
+        invoke_context: &mut InvokeContext,
+        _arg0: u64,
+        _arg1: u64,
+        _arg2: u64,
+        _arg3: u64,
+        _arg4: u64,
+        _memory_mapping: &mut MemoryMapping,
+    ) -> Result<u64, Box<dyn std::error::Error>> {
+        process_instruction_inner(invoke_context)
+    }
+);
 
 pub fn process_instruction_inner(
     invoke_context: &mut InvokeContext,
@@ -549,12 +551,7 @@ pub fn process_instruction_inner(
     let instruction_data = instruction_context.get_instruction_data();
     let program_id = instruction_context.get_last_program_key(transaction_context)?;
     if loader_v4::check_id(program_id) {
-        if invoke_context
-            .feature_set
-            .is_active(&feature_set::native_programs_consume_cu::id())
-        {
-            invoke_context.consume_checked(DEFAULT_COMPUTE_UNITS)?;
-        }
+        invoke_context.consume_checked(DEFAULT_COMPUTE_UNITS)?;
         match limited_deserialize(instruction_data)? {
             LoaderV4Instruction::Write { offset, bytes } => {
                 process_instruction_write(invoke_context, offset, bytes)
@@ -661,7 +658,6 @@ mod tests {
                             .clone(),
                         0,
                         0,
-                        None,
                         programdata,
                         account.data().len(),
                         &mut load_program_metrics,
@@ -700,7 +696,7 @@ mod tests {
             transaction_accounts,
             instruction_accounts,
             expected_result,
-            super::process_instruction,
+            Entrypoint::vm,
             |invoke_context| {
                 invoke_context
                     .programs_modified_by_tx
